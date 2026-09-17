@@ -43,14 +43,31 @@ impl Bump {
         }
     }
 
+    pub fn new_a(&mut self, value: i32, value2: f64) -> &mut A {
+        let x = self.alloc_raw(Layout::new::<A>()) as *mut A;
+        unsafe {
+
+            let v = &mut *x;
+            v.i = value;
+            v.j = value2;
+            v
+        }
+    }
+
     pub fn reset(&mut self) {
         self.offset = 0;
     }
 }
 
+#[derive(Debug)]
+struct A {
+    i: i32,
+    j: f64
+}
+
 #[test]
 fn test() {
     let mut bump = Bump::new(1024);
-    let x = bump.alloc(12.5);
-    println!("{}", x)
+    let a = bump.new_a(12, 5.6);
+    println!("{:?}", a);
 }

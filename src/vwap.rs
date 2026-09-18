@@ -8,7 +8,7 @@ const INV_BIN_DURATION_SECS: f64 = 1.0 / BIN_DURATION_SECS; // Fast multiply inv
 pub struct VwapConfig {
     pub parent_qty: u64,
     /// Bin weights normalized such that sum(weights) == 1.0 (Fixed-size array)
-    pub historical_weights: [f64; NUM_BINS],
+    pub historical_vwap_curve: [f64; NUM_BINS],
     /// Maximum participation cap per bin (e.g., 0.15 for 15%)
     pub max_participation_rate: f64,
 }
@@ -41,7 +41,7 @@ impl VwapScheduler {
         let mut i = NUM_BINS;
         while i > 0 {
             i -= 1;
-            accum += config.historical_weights[i];
+            accum += config.historical_vwap_curve[i];
             suffix_weights[i] = accum;
         }
 
@@ -69,7 +69,7 @@ impl VwapScheduler {
         let bin = self.state.current_bin;
 
         //avoid bounds checks with unsafe
-        let weight_k = unsafe { *self.config.historical_weights.get_unchecked(bin) };
+        let weight_k = unsafe { *self.config.historical_vwap_curve.get_unchecked(bin) };
         let rem_weight = unsafe { *self.suffix_weights.get_unchecked(bin) };
 
         let base_slice = if rem_weight > 0.0 {
@@ -130,6 +130,64 @@ pub struct OrderManager {
 
     // Controls exchange order pacing (prevents spamming ticks)
     min_trade_threshold: u64,
+
+    benchmark: VwapBenchmark,
+    tick_counter: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct VwapBenchmark {
+    pub market_num: f64, // Σ(price * volume)
+    pub market_den: f64, // Σ(volume)
+    pub exec_num: f64,   // Σ(fill_price * fill_qty)
+    pub exec_den: f64,   // Σ(fill_qty)
+}
+
+// VWAP = Σ(price_i * volume_i) / Σ(volume_i)
+//
+// numerator   = Σ(price_i * volume_i)
+// denominator = Σ(volume_i)
+//
+// Example:
+// Trades: (10.0, 100), (20.0, 200)
+// numerator = 10*100 + 20*200 = 5000
+// denominator = 100 + 200 = 300
+// vwap = 5000 / 300 = 16.666...
+impl VwapBenchmark {
+    #[inline(always)]
+    pub fn update_market(&mut self, price: f64, qty: u64) {
+        self.market_num += price * qty as f64;
+        self.market_den += qty as f64;
+    }
+
+    #[inline(always)]
+    pub fn update_exec(&mut self, price: f64, qty: u64) {
+        self.exec_num += price * qty as f64;
+        self.exec_den += qty as f64;
+    }
+
+    #[inline(always)]
+    pub fn market_vwap(&self) -> f64 {
+        if self.market_den > 0.0 {
+            self.market_num / self.market_den
+        } else {
+            0.0
+        }
+    }
+
+    #[inline(always)]
+    pub fn execution_vwap(&self) -> f64 {
+        if self.exec_den > 0.0 {
+            self.exec_num / self.exec_den
+        } else {
+            0.0
+        }
+    }
+
+    #[inline(always)]
+    pub fn slippage(&self) -> f64 {
+        self.execution_vwap() - self.market_vwap()
+    }
 }
 
 impl OrderManager {
@@ -145,6 +203,8 @@ impl OrderManager {
             filled_in_current_bin: 0,
             working_order_qty: 0,
             min_trade_threshold,
+            benchmark: VwapBenchmark::default(),
+            tick_counter: 0,
         }
     }
 
@@ -153,8 +213,15 @@ impl OrderManager {
     pub fn on_market_trade(
         &mut self,
         trade_qty: u64,
+        trade_price: f64,
         elapsed_bin_secs: f64,
     ) -> Option<OrderAction> {
+        self.tick_counter += 1;
+
+        // Update VWAP only every 16 ticks
+        if (self.tick_counter & 0b1111) == 0 {
+            self.benchmark.update_market(trade_price, trade_qty);
+        }
         let current_bin = self.scheduler.state.current_bin;
         if current_bin >= NUM_BINS {
             return None;
@@ -201,8 +268,10 @@ impl OrderManager {
     }
 
     /// Asynchronous Execution Fill Handler
-    pub fn on_execution_fill(&mut self, filled_qty: u64) {
+    pub fn on_execution_fill(&mut self, fill_price: f64, filled_qty: u64) {
         self.scheduler.on_fill(filled_qty);
+
+        self.benchmark.update_exec(fill_price, filled_qty);
         self.filled_in_current_bin += filled_qty;
         self.working_order_qty = self.working_order_qty.saturating_sub(filled_qty);
     }
@@ -223,7 +292,7 @@ mod tests {
         let weight = 1.0 / (NUM_BINS as f64);
         let config = VwapConfig {
             parent_qty: 78_000,
-            historical_weights: [weight; NUM_BINS],
+            historical_vwap_curve: [weight; NUM_BINS],
             max_participation_rate: 0.50,
         };
         let expected_volumes = [10_000; NUM_BINS]; // Expect 10,000 bin
@@ -238,18 +307,17 @@ mod tests {
 
         // 1. First trade tick at 1.5 mins (30% elapsed). 3,000 traded -> On target pace!
         // Extrapolated volume = 3,000 / 0.30 = 10,000. Ratio = 1.0. Target = 1,000 .
-        let action = om.on_market_trade(3_000, 90.0);
+        let action = om.on_market_trade(3_000, 134.5, 90.0);
         assert_eq!(action, Some(OrderAction::NewOrder { qty: 1_000 }));
 
-        // 2. Tiny tick of 10 arrives. Drift is only 10  (< 100 threshold).
-        // Should NOT issue an exchange modification to protect queue priority.
-        let action2 = om.on_market_trade(10, 91.0);
+        // 2. Tiny tick of 10 arrives. Drift is only 10 (< 100 threshold).
+        let action2 = om.on_market_trade(10, 91.0, 91.0);
         assert_eq!(action2, None);
 
         // 3. Huge volume surge of 6,000 arrives at 2.0 mins (40% elapsed).
         // Total raw volume = 9,010. Extrapolated = 9,010 / 0.40 = 22,525 (2.25x surge).
         // Target = 1,000 * 2.2525 = 2,253 . Drift = 2,253 - 1,000 = 1,253 (> 100).
-        let action3 = om.on_market_trade(6_000, 120.0);
+        let action3 = om.on_market_trade(6_000, 120.0, 120.0);
         assert_eq!(action3, Some(OrderAction::ModifyOrder { new_qty: 2_253 }));
     }
 
@@ -258,10 +326,10 @@ mod tests {
         let mut om = mock_setup();
 
         // Place initial order for 1,000
-        om.on_market_trade(3_000, 90.0);
+        om.on_market_trade(3_000, 90.0, 90.0);
 
-        // Receive partial fill of 400
-        om.on_execution_fill(400);
+        // Receive partial fill of 400 @ price 135.0
+        om.on_execution_fill(135.0, 400);
         assert_eq!(om.working_order_qty, 600);
         assert_eq!(om.scheduler.state.remaining_qty, 77_600);
 
@@ -270,6 +338,54 @@ mod tests {
         assert_eq!(om.scheduler.state.current_bin, 1);
         assert_eq!(om.working_order_qty, 0);
         assert_eq!(om.raw_bin_volume, 0);
+    }
+
+    #[test]
+    fn test_market_vwap_updates_correctly() {
+        let mut om = mock_setup();
+
+        // Trades:
+        // 100 @ 10.0  → num = 1000, denominator = 100
+        // 200 @ 20.0  → num = 1000 + 4000 = 5000, denominator = 300
+        om.on_market_trade(100, 10.0, 1.0);
+        om.on_market_trade(200, 20.0, 2.0);
+
+        let vwap = om.benchmark.market_vwap();
+        assert!((vwap - (5000.0 / 300.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_execution_vwap_updates_correctly() {
+        let mut om = mock_setup();
+
+        // Fills:
+        // 50 @ 100.0 → num = 5000, denominator = 50
+        // 50 @ 200.0 → num = 5000 + 10000 = 15000, denominator = 100
+        om.on_execution_fill(100.0, 50);
+        om.on_execution_fill(200.0, 50);
+
+        let exec_vwap = om.benchmark.execution_vwap();
+        assert!((exec_vwap - 150.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_slippage_calculation() {
+        let mut om = mock_setup();
+
+        // Market VWAP:
+        // 100 @ 10.0 → 1000
+        // 100 @ 20.0 → 2000
+        // market_vwap = 3000 / 200 = 15.0
+        om.on_market_trade(100, 10.0, 1.0);
+        om.on_market_trade(100, 20.0, 2.0);
+
+        // Execution VWAP:
+        // 100 @ 18.0 → 1800
+        // exec_vwap = 1800 / 100 = 18.0
+        om.on_execution_fill(18.0, 100);
+
+        let slip = om.benchmark.slippage();
+        assert!((slip - 3.0).abs() < 1e-9); // 18 - 15 = 3
     }
 }
 
@@ -301,31 +417,30 @@ mod alloc_tests {
         let weight = 1.0 / (NUM_BINS as f64);
         let config = VwapConfig {
             parent_qty: 78_000,
-            historical_weights: [weight; NUM_BINS],
+            historical_vwap_curve: [weight; NUM_BINS],
             max_participation_rate: 0.50,
         };
-        let expected_volumes = [10_000; NUM_BINS]; // Expect 10,000 bin
-        let min_threshold = 100; // Require 100 drift to trigger exchange action
+        let expected_volumes = [10_000; NUM_BINS];
+        let min_threshold = 100;
 
         OrderManager::new(config, expected_volumes, min_threshold)
     }
+
     #[test]
     fn test_zero_allocations_on_hot_path() {
         let mut om = mock_setup();
 
-        // Capture allocation count before running hot-path operations
         let allocs_before = ALLOC_COUNT.load(Ordering::SeqCst);
 
-        // Simulate 1,000,000 market trade ticks
         for i in 0..1_000_000 {
             let elapsed = (i % 300) as f64;
-            let action = om.on_market_trade(100, elapsed);
+            let price = (i % 100) as f64 + 50.0;
+            let action = om.on_market_trade(100, price, elapsed);
             std::hint::black_box(action);
         }
 
         let allocs_after = ALLOC_COUNT.load(Ordering::SeqCst);
 
-        // Strict assertion: exactly zero allocations must occur
         assert_eq!(
             allocs_before, allocs_after,
             "Memory was allocated during the hot path!"
